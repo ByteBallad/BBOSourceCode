@@ -1,0 +1,258 @@
+%function [RunResult, RunValue, RunTime, RunFES, RunOptimization, RunParameter] = tracking_BBO_test(problem, N, runmax)
+function [par] = tracking_BBO(framei, N, runmax, par, q_u, Hx, Hy, rBin, gBin, bBin)
+'tracking_BBO'
+%D = Dim(problem); % 3-6 rows, please refer to CEP
+%lu = Boundary(problem, 2);
+lu = [];
+%lu;
+%TEV = Error();
+TEV = -1;
+FESMAX = 10000 * 2;
+RunOptimization = zeros(runmax, 2);
+
+for run = 1 : runmax
+    TimeFlag = 0;
+    TempFES = FESMAX;
+    t1 = clock;
+    
+    %x = Initpop(N, 2, lu); % population initialization
+    for index=1:N
+        x(index,:)=par(index).pos;
+    end
+    %fitness = benchmark_func(x, problem); % calculate individual fitness
+    for index=1:N
+        fitness(index,:)=-par(index).cost;
+    end
+    
+    
+    FES = N; % current function evaluation times
+    [fitness_sorted, order] = sort(fitness); % the population was ordered by fitness
+    sort_population = x(order, :);
+    
+    % Parameterized initialization
+    Iteration = 1; % Current iteration
+    OPTIONS.popsize = N; % total population size
+    OPTIONS.Maxgen = FESMAX / N; % generation count limit
+    OPTIONS.numVar = 2; % number of genes in each population member
+    OPTIONS.pmodify = 1; % habitat modification probability
+    OPTIONS.pmutate = 0.005; % initial mutation probability
+    Keep = 2; % elitism parameter: how many of the best habitats to keep from one generation to the next
+    lambdaLower = 0.0; % lower bound for migration probability per gene
+    lambdaUpper = 1; % upper bound for migration probability per gene
+    dt = 1; % step size used for numerical integration of probabilities
+    I = 1; % max immigration rate for each island
+    E = 1; % max emigration rate for each island
+    P = OPTIONS.popsize; % max species count for each island
+    for popindex = 1 : OPTIONS.popsize
+        Population(popindex).chrom = sort_population(popindex, :);
+        Population(popindex).fitness = fitness_sorted(popindex);
+    end
+    % Initialize the species count probability of each habitat
+    % Later we might want to initialize probabilities based on cost
+    for j = 1 : size(x,1)
+        Prob(j) = 1 / size(x,1);
+    end
+    h = 1; % sampling points during each run
+    
+    
+    % Begin the optimization loop 
+    while FES <= FESMAX
+        % Save the best habitats in a temporary array
+        for j = 1 : Keep
+            chromKeep(j, :) = Population(j).chrom;
+            fitnessKeep(j) = Population(j).fitness;
+        end
+        % Map fitness values to species counts
+        [Population] = GetSpeciesCounts(Population, P);
+        % Calculate immigration rate and emigration rate for each species count
+        % lambda(i) is the immigration rate for individual i
+        % mu(i) is the emigration rate for individual i
+        [lambda, mu] = GetLambdaMu(Population, I, E, P);
+        
+        % ProbFlag = true or false, whether or not to use probabilities to
+        % update migration rates and to mutate
+        ProbFlag = true;
+        if ProbFlag
+            % Compute the time derivative of Prob(i) for each habitat i.
+            for j = 1 : length(Population)
+                % Compute lambda for one less than the species count of habitat i.
+                lambdaMinus = I * (1 - (Population(j).SpeciesCount - 1) / P);
+                % Compute mu for one more than the species count of habitat i.
+                muPlus = E * (Population(j).SpeciesCount + 1) / P;
+                % Compute Prob for one less than and one more than the species count of habitat i.
+                % Note that species counts are arranged in an order opposite to that presented in
+                % MacArthur and Wilson's book - that is, the most fit
+                % habitat has index 1, which has the highest species count.
+                if j < length(Population)
+                    ProbMinus = Prob(j+1);
+                else
+                    ProbMinus = 0;
+                end
+                if j > 1
+                    ProbPlus = Prob(j-1);
+                else
+                    ProbPlus = 0;
+                end
+                ProbDot(j) = -(lambda(j) + mu(j)) * Prob(j) + lambdaMinus * ProbMinus + muPlus * ProbPlus;
+            end
+            % Compute the new probabilities for each species count.
+            Prob = Prob + ProbDot * dt;
+            Prob = max(Prob, 0);
+            Prob = Prob / sum(Prob);
+        end
+        % Now use lambda and mu to decide how much information to share between habitats
+        lambdaMin = min(lambda);
+        lambdaMax = max(lambda);
+        for k = 1 : length(Population)
+            if rand > OPTIONS.pmodify
+                continue;
+            end
+            % Normalize the immigration rate
+            lambdaScale = lambdaLower + (lambdaUpper - lambdaLower) * (lambda(k) - lambdaMin) / (lambdaMax - lambdaMin);
+            % Probabilistically input new information into habitat i
+            for j = 1 : OPTIONS.numVar
+                if rand < lambdaScale
+                    % Pick a habitat from which to obtain a feature
+                    RandomNum = rand * sum(mu);
+                    Select = mu(1);
+                    SelectIndex = 1;
+                    while (RandomNum > Select) && (SelectIndex < OPTIONS.popsize)
+                        SelectIndex = SelectIndex + 1;
+                        Select = Select + mu(SelectIndex);
+                    end
+                    Island(k,j) = Population(SelectIndex).chrom(j);
+                else
+                    Island(k,j) = Population(k).chrom(j);
+                end
+            end
+        end
+        if ProbFlag
+            % Mutation
+            Pmax = max(Prob);
+            MutationRate = OPTIONS.pmutate * (1 - Prob / Pmax);
+            
+            % Mutate the all of the solutions
+            for k = 1 : length(Population)
+
+                rmin = round(Population(k).chrom(1,1)-Hy);
+                rmax = round(Population(k).chrom(1,1)+Hy);
+                cmin = round(Population(k).chrom(1,2)-Hx);
+                cmax = round(Population(k).chrom(1,2)+Hx);
+
+                lu = [rmin cmin ;rmax cmax ];
+                
+            % Mutate only the worst half of the solutions          
+            % for k = round(length(Population)/2) : length(Population)
+                for parnum = 1 : OPTIONS.numVar
+                    if MutationRate(k) > rand
+                        Island(k,parnum) = floor(lu(1, parnum) + (lu(2, parnum) - lu(1, parnum)) * rand);
+                        % Make sure each individual is legal
+                        Island(k, parnum) = max(Island(k, parnum), lu(1, parnum));
+                        Island(k, parnum) = min(Island(k, parnum), lu(2, parnum));
+                    end
+                end
+            end
+        end
+        
+        %fitness = benchmark_func(Island, problem); % calculate fitness
+        for ii=1:length(Population)
+            p_u(ii,:)= rgbHist(double(framei),Island(ii, :),Hx,Hy,rBin,gBin,bBin);
+            SQR(ii,:) = sqrt(q_u.*p_u(ii,:));
+            rho_n(1,ii) = sum(SQR(ii,:));
+            fitness(ii) = -rho_n(1,ii);
+        end
+        
+        [fitness_sorted, order] = sort(fitness); % the population was ordered by fitness
+        sort_population = Island(order, :);
+        % Replace the worst with the previous generation's elites
+        n = length(Population);
+        for k = 1 : Keep
+            sort_population(n - k + 1, :) = chromKeep(k, :);
+            fitness_sorted(n - k + 1) =  fitnessKeep(k);
+        end
+        [fitness_sorted, order] = sort(fitness_sorted); % the population was ordered again
+        sort_population = sort_population(order, :);
+        for i = 1 : OPTIONS.popsize
+            Population(i).chrom = sort_population(i, :);
+            Population(i).fitness = fitness_sorted(i);
+        end
+        % Make sure the population does not have duplicates
+        Population = ClearDups(Population, lu);
+        for i = 1 : OPTIONS.popsize
+            if FES == 10000 * 0.1 || mod(FES, 10000) == 0
+                [kk, ll] = min(fitness_sorted);
+                RunValue(run, h) = kk;
+                Para(h, :) = sort_population(ll, :);
+                h = h + 1;
+                %fprintf('Algorithm:%s problemIndex:%d Run:%d FES:%d Best:%g\n','BBO',problem,run,FES,kk);
+            end
+            FES = FES + 1;
+            if TimeFlag == 0
+                if min(fitness) <= TEV
+                    TempFES = FES;
+                    TimeFlag = 1;
+                end
+            end
+        end
+        if Iteration == 3
+            for index1=1:N
+                par(index1).pos = Population(index1).chrom;
+                par(index1).cost = Population(index1).fitness;
+            end
+            return;
+        end
+        Iteration = Iteration + 1;
+    end
+    [kk, ll] = min(fitness_sorted);
+    gbest = sort_population(ll, :);
+    t2 = clock;
+    RunTime(run) = etime(t2, t1);
+    RunResult(run) = kk;
+    RunFES(run) = TempFES;
+    RunOptimization(run, 1 : OPTIONS.numVar) = gbest;
+    RunParameter{run} = Para;
+end
+return;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+function [Population] = GetSpeciesCounts(Population, P)
+% Map fitness values to species counts
+% This loop assumes the population is already sorted from most fit to least
+% fit
+for i = 1 : length(Population)
+    if Population(i).fitness < inf
+        Population(i).SpeciesCount = P - i;
+    else
+        Population(i).SpeciesCount = 0;
+    end
+end
+return;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+function [lambda, mu] = GetLambdaMu(Population, I, E, P)
+% Calculate immigration rate and emigration rate for each species count
+% lambda(i) is the immigration rate for individual i
+% mu(i) is the emigration rate for individual i
+for i = 1 : length(Population)
+    lambda(i) = I * (1 - Population(i).SpeciesCount / P);
+    mu(i) = E * Population(i).SpeciesCount / P;
+end
+return;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+function [Population] = ClearDups(Population, lu)
+
+% Make sure there are no duplicate individuals in the population.
+% This logic does not make 100% sure that no duplicates exist, but any duplicates that are found are
+% randomly mutated, so there should be a good chance that there are no duplicates after this procedure.
+for i = 1 : length(Population)
+    Chrom1 = sort(Population(i).chrom);
+    for j = i+1 : length(Population)
+        Chrom2 = sort(Population(j).chrom);
+        if isequal(Chrom1, Chrom2)
+            parnum = ceil(length(Population(j).chrom) * rand);
+            Population(j).chrom(parnum) = floor(lu(1, parnum) + (lu(2, parnum) - lu(1, parnum) + 1) * rand);
+        end
+    end
+end
+return;
